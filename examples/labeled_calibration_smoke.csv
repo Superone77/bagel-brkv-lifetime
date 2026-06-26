@@ -1,0 +1,17 @@
+task,role,layer_band,cutoff,human_label,mae_vs_baseline,retired_step_fraction,zeroed_bytes_upper_bound
+editing,main:image,L24-L27,0,minor,31.0,1.0,753442816
+editing,main:image,L24-L27,T/3,pass,18.0,0.67,502295210
+editing,main:image,L24-L27,2T/3,pass,4.0,0.33,251147605
+editing,main:image,L24-L27,T+1,pass,0.0,0.0,0
+editing,main:text,L14-L20,0,fail,80.0,1.0,44900352
+editing,main:text,L14-L20,T/3,minor,18.0,0.67,30000000
+editing,main:text,L14-L20,2T/3,pass,1.9,0.33,15597568
+editing,main:text,L14-L20,T+1,pass,0.0,0.0,0
+editing,cfg_text:image,L24-L27,0,pass,5.0,1.0,753442816
+editing,cfg_text:image,L24-L27,T/3,pass,4.0,0.67,502295210
+editing,cfg_text:image,L24-L27,2T/3,pass,2.0,0.33,251147605
+editing,cfg_text:image,L24-L27,T+1,pass,0.0,0.0,0
+editing,cfg_img:text,L24-L27,0,pass,2.0,1.0,53387264
+editing,cfg_img:text,L24-L27,T/3,pass,1.0,0.67,35954688
+editing,cfg_img:text,L24-L27,2T/3,pass,0.5,0.33,17977344
+editing,cfg_img:text,L24-L27,T+1,pass,0.0,0.0,0
