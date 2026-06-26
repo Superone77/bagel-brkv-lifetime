@@ -1,0 +1,23 @@
+calibration_script: analyze_conditioning_kv_role_cutoff_standard.py
+policy_script: run_kv_lifecycle_scheduler_policy.py
+
+run:
+  model_path: /Users/vinci/Documents/Project/Transformers/models/BAGEL-7B-MoT
+  output_dir: /Users/vinci/Documents/Project/Transformers/outputs/brkv_audrey_smoke
+  image: /Users/vinci/Documents/Project/Transformers/BAGEL/test_images/women.jpg
+  device: mps
+  dtype: bfloat16
+  image_size: 320
+  timesteps: 6
+  cfg_text_scale: 4.0
+  cfg_img_scale: 2.0
+  seed: 20260621
+  variants: smoke
+  span_mode: auto
+  prompt: >-
+    Edit the input portrait so that the person's red outfit becomes a vivid
+    bright blue coat, and replace the gray studio background with a realistic
+    snowy mountain lake landscape. Preserve the same person identity, facial
+    expression, hairstyle, pose, hand position, framing, lighting, and white
+    poodle applique. Avoid changing the face shape, camera angle, body pose,
+    or composition.
