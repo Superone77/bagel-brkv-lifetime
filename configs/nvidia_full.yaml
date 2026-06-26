@@ -1,0 +1,23 @@
+calibration_script: analyze_conditioning_kv_role_cutoff_standard.py
+policy_script: run_kv_lifecycle_scheduler_policy.py
+
+run:
+  model_path: /workspace/models/BAGEL-7B-MoT
+  output_dir: /workspace/outputs/brkv_full
+  image: /workspace/data/bagel_editing/audrey/women.jpg
+  device: cuda
+  dtype: bfloat16
+  image_size: 512
+  timesteps: 50
+  cfg_text_scale: 4.0
+  cfg_img_scale: 2.0
+  seed: 20260621
+  variants: grid
+  span_mode: auto
+  prompt: >-
+    Edit the input portrait so that the person's red outfit becomes a vivid
+    bright blue coat, and replace the gray studio background with a realistic
+    snowy mountain lake landscape. Preserve the same person identity, facial
+    expression, hairstyle, pose, hand position, framing, lighting, and white
+    poodle applique. Avoid changing the face shape, camera angle, body pose,
+    or composition.
