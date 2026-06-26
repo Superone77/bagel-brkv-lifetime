@@ -14,5 +14,14 @@ if [[ ! -d "$BAGEL_ROOT/modeling" || ! -d "$BAGEL_ROOT/data" ]]; then
   exit 2
 fi
 
-cp "$ROOT"/bagel_scripts/*.py "$BAGEL_ROOT"/
+if [[ -f "$ROOT/bagel_scripts.tar.gz.b64" ]]; then
+  tmpdir="$(mktemp -d)"
+  base64 -d -i "$ROOT/bagel_scripts.tar.gz.b64" -o "$tmpdir/bagel_scripts.tar.gz" 2>/dev/null \
+    || base64 -d "$ROOT/bagel_scripts.tar.gz.b64" > "$tmpdir/bagel_scripts.tar.gz"
+  tar -xzf "$tmpdir/bagel_scripts.tar.gz" -C "$tmpdir"
+  cp "$tmpdir"/bagel_scripts/*.py "$BAGEL_ROOT"/
+  rm -rf "$tmpdir"
+else
+  cp "$ROOT"/bagel_scripts/*.py "$BAGEL_ROOT"/
+fi
 echo "Installed BR-KV BAGEL helper scripts into $BAGEL_ROOT"
