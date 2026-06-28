@@ -24,4 +24,19 @@ if [[ -f "$ROOT/bagel_scripts.tar.gz.b64" ]]; then
 else
   cp "$ROOT"/bagel_scripts/*.py "$BAGEL_ROOT"/
 fi
-echo "Installed BR-KV BAGEL helper scripts into $BAGEL_ROOT"
+
+PATCH="$ROOT/patches/uni4uni_kv_bagel_hooks.patch"
+if [[ -f "$PATCH" ]]; then
+  if git -C "$BAGEL_ROOT" apply --check "$PATCH"; then
+    git -C "$BAGEL_ROOT" apply "$PATCH"
+    echo "Applied Uni4Uni-KV BAGEL hook patch."
+  elif git -C "$BAGEL_ROOT" apply --reverse --check "$PATCH"; then
+    echo "Uni4Uni-KV BAGEL hook patch already applied."
+  else
+    echo "Cannot apply Uni4Uni-KV BAGEL hook patch cleanly in $BAGEL_ROOT" >&2
+    echo "Please inspect $PATCH and the target BAGEL checkout." >&2
+    exit 1
+  fi
+fi
+
+echo "Installed Uni4Uni-KV BAGEL helper scripts into $BAGEL_ROOT"

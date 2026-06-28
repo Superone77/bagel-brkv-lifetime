@@ -1,0 +1,423 @@
+diff --git a/modeling/bagel/bagel.py b/modeling/bagel/bagel.py
+index dd14009..d961e1e 100644
+--- a/modeling/bagel/bagel.py
++++ b/modeling/bagel/bagel.py
+@@ -17,13 +17,21 @@ from data.data_utils import (
+     get_flattened_position_ids_interpolate,
+     patchify, 
+ )
+-from .qwen2_navit import NaiveCache
++from .qwen2_navit import NaiveCache, set_topk_kv_context
+ from .modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding
+ from modeling.cache_utils.taylorseer import cache_init
+ 
+ from tqdm import tqdm
+ 
+ 
++def autocast_for_device(device):
++    if device.type == "cuda":
++        return torch.amp.autocast(device.type, enabled=True, dtype=torch.bfloat16)
++    if device.type == "mps":
++        return torch.amp.autocast(device.type, enabled=True, dtype=torch.bfloat16)
++    return torch.amp.autocast("cpu", enabled=False)
++
++
+ class BagelConfig(PretrainedConfig):
+     def __init__(
+         self,
+@@ -696,6 +704,7 @@ class Bagel(PreTrainedModel):
+         timesteps = timesteps[:-1]
+ 
+         for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
++            set_topk_kv_context(phase="generation", step_index=i, total_steps=len(timesteps))
+ 
+             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
+             if t > cfg_interval[0] and t <= cfg_interval[1]:
+@@ -943,6 +952,7 @@ class Bagel(PreTrainedModel):
+         generated_sequence = []
+         curr_tokens = packed_start_tokens
+         while step < max_length:
++            set_topk_kv_context(phase="understanding", step_index=step, total_steps=max_length)
+             generated_sequence.append(curr_tokens)
+             packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
+             query_lens = torch.ones_like(curr_tokens)
+@@ -1038,7 +1048,7 @@ class Bagel(PreTrainedModel):
+             for k, v in generation_input.items():
+                 if torch.is_tensor(v):
+                     generation_input[k] = v.to(device)
+-            with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
++            with autocast_for_device(device):
+                 past_key_values = self.forward_cache_update_vit(past_key_values, **generation_input)
+ 
+         # add text
+@@ -1052,7 +1062,7 @@ class Bagel(PreTrainedModel):
+         for k, v in generation_input.items():
+             if torch.is_tensor(v):
+                 generation_input[k] = v.to(device)
+-        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
++        with autocast_for_device(device):
+             past_key_values = self.forward_cache_update_text(past_key_values, **generation_input)
+ 
+         # decode
+@@ -1060,7 +1070,7 @@ class Bagel(PreTrainedModel):
+         for k, v in generation_input.items():
+             if torch.is_tensor(v):
+                 generation_input[k] = v.to(device)
+-        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
++        with autocast_for_device(device):
+             unpacked_latent = self.generate_text(
+                 past_key_values=past_key_values,
+                 max_length=max_length,
+@@ -1072,4 +1082,4 @@ class Bagel(PreTrainedModel):
+         output = tokenizer.decode(unpacked_latent[:,0])
+         output = output.split('<|im_end|>')[0].split('<|im_start|>')[1]
+ 
+-        return output
+\ No newline at end of file
++        return output
+diff --git a/modeling/bagel/qwen2_navit.py b/modeling/bagel/qwen2_navit.py
+index cdbc757..bcfbd82 100644
+--- a/modeling/bagel/qwen2_navit.py
++++ b/modeling/bagel/qwen2_navit.py
+@@ -10,6 +10,7 @@
+ # This modified file is released under the same license.
+ 
+ 
++import math
+ from dataclasses import dataclass
+ from functools import partial
+ from typing import List, Optional, Tuple
+@@ -21,7 +22,10 @@ from torch.nn.attention.flex_attention import flex_attention
+ from torch.nn.functional import scaled_dot_product_attention
+ from transformers.utils import ModelOutput
+ 
+-from flash_attn import flash_attn_varlen_func
++try:
++    from flash_attn import flash_attn_varlen_func
++except ImportError:
++    flash_attn_varlen_func = None
+ from modeling.qwen2.modeling_qwen2 import (
+     Qwen2Attention, 
+     Qwen2MLP, 
+@@ -43,6 +47,107 @@ torch._dynamo.config.accumulated_cache_size_limit = 4096
+ flex_attention = torch.compile(flex_attention)
+ 
+ 
++ATTENTION_RECORDER = None
++TOPK_KV_POLICY = None
++
++
++def set_attention_recorder(recorder):
++    global ATTENTION_RECORDER
++    ATTENTION_RECORDER = recorder
++
++
++def set_topk_kv_policy(policy):
++    global TOPK_KV_POLICY
++    TOPK_KV_POLICY = policy
++
++
++def clear_topk_kv_policy():
++    set_topk_kv_policy(None)
++
++
++def set_topk_kv_context(*, phase=None, step_index=None, total_steps=None):
++    if TOPK_KV_POLICY is None:
++        return
++    setter = getattr(TOPK_KV_POLICY, "set_context", None)
++    if setter is not None:
++        setter(phase=phase, step_index=step_index, total_steps=total_steps)
++
++
++def _record_token_attention(
++    layer_idx,
++    packed_query_states,
++    merged_key_states,
++    cu_seqlens_q,
++    cu_seqlens_k,
++    causal,
++):
++    if ATTENTION_RECORDER is None or not getattr(ATTENTION_RECORDER, "enabled", False):
++        return
++    if layer_idx not in ATTENTION_RECORDER.layers:
++        return
++
++    cu_q = cu_seqlens_q.to("cpu").tolist()
++    cu_k = cu_seqlens_k.to("cpu").tolist()
++    scale = float(packed_query_states.shape[-1]) ** -0.5
++    with torch.no_grad():
++        for sample_idx in range(len(cu_q) - 1):
++            q_i = packed_query_states[cu_q[sample_idx]:cu_q[sample_idx + 1]]
++            k_i = merged_key_states[cu_k[sample_idx]:cu_k[sample_idx + 1]]
++            if q_i.numel() == 0 or k_i.numel() == 0:
++                continue
++            query_labels = ATTENTION_RECORDER.query_labels
++            selected_query_labels = query_labels
++            query_types_to_record = getattr(ATTENTION_RECORDER, "query_types_to_record", None)
++            if query_types_to_record and query_labels is not None and len(query_labels) == q_i.shape[0]:
++                query_mask = torch.tensor(
++                    [label in query_types_to_record for label in query_labels],
++                    device=q_i.device,
++                    dtype=torch.bool,
++                )
++                if not bool(query_mask.any()):
++                    continue
++                q_i = q_i[query_mask]
++                selected_query_labels = [label for label, keep in zip(query_labels, query_mask.tolist()) if keep]
++            if q_i.shape[1] != k_i.shape[1]:
++                repeat = q_i.shape[1] // k_i.shape[1]
++                k_i = k_i.repeat_interleave(repeat, dim=1)
++            q_i = q_i.detach().float().cpu().transpose(0, 1)
++            k_i = k_i.detach().float().cpu().transpose(0, 1)
++            scores = torch.matmul(q_i, k_i.transpose(-1, -2)) * scale
++            if causal:
++                attn_mask = _bottom_right_causal_mask(q_i.shape[1], k_i.shape[1], q_i.device)
++                scores = scores.masked_fill(~attn_mask.unsqueeze(0), torch.finfo(scores.dtype).min)
++            probs = torch.softmax(scores, dim=-1)
++            key_received = probs.mean(dim=(0, 1)).detach().to("cpu")
++            ATTENTION_RECORDER.record(
++                layer_idx=layer_idx,
++                sample_idx=sample_idx,
++                query_len=int(q_i.shape[1]),
++                key_len=int(k_i.shape[1]),
++                query_type="all",
++                key_received=key_received,
++            )
++            query_labels = selected_query_labels
++            if query_labels is not None and len(query_labels) == q_i.shape[1]:
++                for query_type in sorted(set(query_labels)):
++                    mask = torch.tensor(
++                        [label == query_type for label in query_labels],
++                        device=probs.device,
++                        dtype=torch.bool,
++                    )
++                    if not bool(mask.any()):
++                        continue
++                    grouped = probs[:, mask, :].mean(dim=(0, 1)).detach().to("cpu")
++                    ATTENTION_RECORDER.record(
++                        layer_idx=layer_idx,
++                        sample_idx=sample_idx,
++                        query_len=int(mask.sum().item()),
++                        key_len=int(k_i.shape[1]),
++                        query_type=query_type,
++                        key_received=grouped,
++                    )
++
++
+ class Qwen2Config(_Qwen2Config):
+     r"""
+     This is the configuration class to store the configuration of a [`Qwen2Model`]. It is used to instantiate a
+@@ -233,6 +338,157 @@ def pad_sequence(tensor, pad_size):
+     return torch.cat([tensor, pad_tensor], dim=1)
+ 
+ 
++def _bottom_right_causal_mask(query_len, key_len, device):
++    query_positions = torch.arange(query_len, device=device)[:, None]
++    key_positions = torch.arange(key_len, device=device)[None, :]
++    return key_positions <= query_positions + key_len - query_len
++
++
++def _topk_policy_enabled(layer_idx, mode):
++    return (
++        TOPK_KV_POLICY is not None
++        and getattr(TOPK_KV_POLICY, "enabled", False)
++        and getattr(TOPK_KV_POLICY, "phase", None) in {"understanding", "generation", "editing"}
++        and (not hasattr(TOPK_KV_POLICY, "should_apply") or TOPK_KV_POLICY.should_apply(layer_idx, mode))
++    )
++
++
++def _topk_keep_ratio(layer_idx, mode):
++    if TOPK_KV_POLICY is None:
++        return 1.0
++    getter = getattr(TOPK_KV_POLICY, "keep_ratio", None)
++    if getter is None:
++        return 1.0
++    return float(getter(layer_idx, mode))
++
++
++def _topk_record(**kwargs):
++    if TOPK_KV_POLICY is None:
++        return
++    recorder = getattr(TOPK_KV_POLICY, "record", None)
++    if recorder is not None:
++        recorder(**kwargs)
++
++
++def varlen_attention(
++    q,
++    k,
++    v,
++    cu_seqlens_q,
++    cu_seqlens_k,
++    max_seqlen_q,
++    max_seqlen_k,
++    causal,
++    layer_idx=None,
++    mode=None,
++    protected_key_indexes=None,
++):
++    use_topk = layer_idx is not None and _topk_policy_enabled(layer_idx, mode)
++    if flash_attn_varlen_func is not None and q.device.type == "cuda" and not use_topk:
++        return flash_attn_varlen_func(
++            q=q,
++            k=k,
++            v=v,
++            cu_seqlens_q=cu_seqlens_q.to(torch.int32),
++            cu_seqlens_k=cu_seqlens_k.to(torch.int32),
++            max_seqlen_q=max_seqlen_q,
++            max_seqlen_k=max_seqlen_k,
++            causal=causal,
++        )
++
++    outputs = []
++    cu_q = cu_seqlens_q.to("cpu").tolist()
++    cu_k = cu_seqlens_k.to("cpu").tolist()
++    for idx in range(len(cu_q) - 1):
++        q_i = q[cu_q[idx]:cu_q[idx + 1]]
++        k_i = k[cu_k[idx]:cu_k[idx + 1]]
++        v_i = v[cu_k[idx]:cu_k[idx + 1]]
++
++        if q_i.shape[1] != k_i.shape[1]:
++            repeat = q_i.shape[1] // k_i.shape[1]
++            k_i = k_i.repeat_interleave(repeat, dim=1)
++            v_i = v_i.repeat_interleave(repeat, dim=1)
++
++        attn_mask = None
++        if causal:
++            attn_mask = _bottom_right_causal_mask(q_i.shape[0], k_i.shape[0], q_i.device)
++
++        if use_topk:
++            q_h = q_i.transpose(0, 1).float()
++            k_h = k_i.transpose(0, 1).float()
++            scores = torch.matmul(q_h, k_h.transpose(-1, -2)) / math.sqrt(q_i.shape[-1])
++            if attn_mask is not None:
++                scores = scores.masked_fill(~attn_mask.unsqueeze(0), torch.finfo(scores.dtype).min)
++
++            probs = torch.softmax(scores, dim=-1)
++            key_scores = probs.mean(dim=(0, 1))
++            key_len = int(k_i.shape[0])
++            protected_mask = torch.zeros(key_len, device=k_i.device, dtype=torch.bool)
++            if protected_key_indexes is not None:
++                protected = protected_key_indexes.to(device=k_i.device)
++                start = int(cu_k[idx])
++                end = int(cu_k[idx + 1])
++                protected = protected[(protected >= start) & (protected < end)] - start
++                if protected.numel() > 0:
++                    protected_mask[protected.long()] = True
++            extra_protected = getattr(TOPK_KV_POLICY, "extra_protected_key_mask", None)
++            if extra_protected is not None:
++                extra_mask = extra_protected(
++                    key_len=key_len,
++                    protected_mask=protected_mask,
++                    layer_idx=layer_idx,
++                    mode=mode,
++                    device=k_i.device,
++                )
++                if extra_mask is not None:
++                    protected_mask |= extra_mask.to(device=k_i.device, dtype=torch.bool)
++            candidate_mask = ~protected_mask
++            candidate_len = int(candidate_mask.sum().item())
++            keep_ratio = max(0.0, min(1.0, _topk_keep_ratio(layer_idx, mode)))
++            min_keep = int(getattr(TOPK_KV_POLICY, "min_keep", 8))
++            keep_candidate_k = 0
++            if candidate_len > 0:
++                keep_candidate_k = min(candidate_len, max(min_keep, int(math.ceil(candidate_len * keep_ratio))))
++
++            keep_mask = protected_mask.clone()
++            if keep_candidate_k >= candidate_len:
++                keep_mask[candidate_mask] = True
++            elif keep_candidate_k > 0:
++                candidate_scores = key_scores.masked_fill(~candidate_mask, torch.finfo(key_scores.dtype).min)
++                topk_idx = torch.topk(candidate_scores, k=keep_candidate_k, largest=True).indices
++                keep_mask[topk_idx] = True
++            keep_k = int(keep_mask.sum().item())
++
++            masked_scores = scores.masked_fill(~keep_mask[None, None, :], torch.finfo(scores.dtype).min)
++            masked_probs = torch.softmax(masked_scores, dim=-1).to(v_i.dtype)
++            out_i = torch.matmul(masked_probs, v_i.transpose(0, 1)).transpose(0, 1)
++            _topk_record(
++                layer_idx=int(layer_idx),
++                mode=mode or "",
++                sample_idx=int(idx),
++                query_len=int(q_i.shape[0]),
++                key_len=key_len,
++                protected_key_len=int(protected_mask.sum().item()),
++                candidate_key_len=candidate_len,
++                keep_candidate_k=int(keep_candidate_k),
++                keep_k=int(keep_k),
++                keep_ratio=float(keep_k / max(key_len, 1)),
++                candidate_keep_ratio=float(keep_candidate_k / max(candidate_len, 1)),
++                target_keep_ratio=float(keep_ratio),
++                skipped_tokens=int(candidate_len - keep_candidate_k),
++            )
++        else:
++            out_i = scaled_dot_product_attention(
++                q_i.transpose(0, 1).unsqueeze(0),
++                k_i.transpose(0, 1).unsqueeze(0),
++                v_i.transpose(0, 1).unsqueeze(0),
++                attn_mask=attn_mask,
++            )
++            out_i = out_i.squeeze(0).transpose(0, 1)
++        outputs.append(out_i)
++    return torch.cat(outputs, dim=0)
++
++
+ class PackedAttention(Qwen2Attention):
+     def __init__(self, config, layer_idx: Optional[int] = None):
+         super().__init__(config, layer_idx)
+@@ -358,7 +614,16 @@ class PackedAttention(Qwen2Attention):
+         cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0))
+         cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(key_values_lens, dim=0), (1, 0))
+ 
+-        packed_attn_output = flash_attn_varlen_func(
++        _record_token_attention(
++            layer_idx=self.layer_idx,
++            packed_query_states=packed_query_states,
++            merged_key_states=merged_key_states,
++            cu_seqlens_q=cu_seqlens_q,
++            cu_seqlens_k=cu_seqlens_k,
++            causal=is_causal,
++        )
++
++        packed_attn_output = varlen_attention(
+             q=packed_query_states,
+             k=merged_key_states,
+             v=merged_value_states,
+@@ -367,6 +632,9 @@ class PackedAttention(Qwen2Attention):
+             max_seqlen_q=max(query_lens).item(),
+             max_seqlen_k=max(key_values_lens).item(),
+             causal=is_causal,
++            layer_idx=self.layer_idx,
++            mode="und",
++            protected_key_indexes=packed_query_indexes,
+         )
+         packed_attn_output = packed_attn_output.reshape(-1, self.hidden_size)
+         packed_attn_output = self.o_proj(packed_attn_output)
+@@ -576,7 +844,16 @@ class PackedAttentionMoT(Qwen2Attention):
+         cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0))
+         cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(key_values_lens, dim=0), (1, 0))
+ 
+-        packed_attn_output = flash_attn_varlen_func(
++        _record_token_attention(
++            layer_idx=self.layer_idx,
++            packed_query_states=packed_query_states,
++            merged_key_states=merged_key_states,
++            cu_seqlens_q=cu_seqlens_q,
++            cu_seqlens_k=cu_seqlens_k,
++            causal=is_causal,
++        )
++
++        packed_attn_output = varlen_attention(
+             q=packed_query_states,
+             k=merged_key_states,
+             v=merged_value_states,
+@@ -585,6 +862,9 @@ class PackedAttentionMoT(Qwen2Attention):
+             max_seqlen_q=max(query_lens).item(),
+             max_seqlen_k=max(key_values_lens).item(),
+             causal=is_causal,
++            layer_idx=self.layer_idx,
++            mode=mode,
++            protected_key_indexes=packed_query_indexes,
+         )
+         packed_attn_output = packed_attn_output.reshape(-1, self.hidden_size)
+         if mode == 'und':

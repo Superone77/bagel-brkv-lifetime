@@ -1,25 +1,82 @@
 # AGENTS.md
 
-This repository is a handoff package for running BAGEL BR-KV lifetime experiments on an NVIDIA GPU server.
+This repository is a handoff package for running BAGEL Uni4Uni-KV experiments on an NVIDIA GPU server.
 
-## Goal
+## Current Goal
 
-Validate a simple benefit-risk conditioning-KV retirement method for BAGEL-style unified multimodal generation/editing.
+Run and evaluate **Uni4Uni-KV**, a unified KV-cache lifetime / TopK budgeting method for BAGEL-style unified multimodal models.
 
-The method is intentionally static at inference time:
+The current probe keeps BAGEL weights and core computation unchanged. It adds an inference-time attention mask before attention so only selected candidate KV tokens are visible. This is a correctness and quality probe; it reports theoretical skipped KV work, not guaranteed speedup. Real latency claims require physical KV compaction or kernel-level skipping.
 
-1. Run offline calibration over role/layer/cutoff cells.
-2. Label outputs as `pass`, `minor`, or `fail`.
-3. Build BR-KV schedule tables from empirical risk and static benefit.
-4. Validate each table as a joint policy.
+## Method Name
 
-Do not add online attention classifiers or extra forward passes unless explicitly requested.
+Use the name:
 
-## Expected External Dependencies
+```text
+Uni4Uni-KV
+```
 
-You need a working BAGEL checkout and the BAGEL-7B-MoT checkpoint.
+Historical aliases in older notes/code include `BR-KV` and `Unified Pyramid TopK-KV`. Prefer `Uni4Uni-KV` in new reports.
 
-Recommended layout:
+## Core Policy
+
+For each attention layer, candidate KV tokens are ranked by attention probability:
+
+```text
+score(token) = mean over heads and queries of attention_prob(query, token)
+```
+
+The layer keeps TopK candidate KV tokens under a pyramid budget. Current active self/latent KV is protected and must not be evicted.
+
+### Understanding
+
+Only the understanding branch is active.
+
+```text
+mean_keep_ratio = 0.5
+layer budget: shallow layers keep more, deep layers keep less
+alpha_understanding protects the most recent text KV tokens
+```
+
+### Generation / Editing
+
+The generation branch denoising loop is active, conditioned on understanding-side KV.
+
+```text
+mean_keep_ratio decays over denoising steps, e.g. 0.8 -> 0.1
+layer budget: shallow layers keep more, deep layers keep less
+all current VAE latent/self KV is protected
+only conditioning/past KV is budgeted
+```
+
+Do not delete or mask the active VAE latent KV. Bad image quality usually means the implementation accidentally budgeted latent/self KV instead of only conditioning KV.
+
+## PyramidKV-Inspired Parameters
+
+Reference values from PyramidKV:
+
+```text
+beta = 20
+alpha = 8
+```
+
+Local interpretation for BAGEL:
+
+```text
+beta: layer-pyramid shape controller for all tasks
+alpha_understanding: recent-token protection for understanding/text generation only
+alpha_gen/edit: replaced by hard protection of active VAE latent/self KV
+```
+
+Recommended GPU sweep:
+
+```text
+beta in {8, 14, 16, 20}
+alpha_understanding in {8, 16}
+generation schedules in {0.8->0.1, 0.8->0.2, 0.9->0.2, 0.9->0.3}
+```
+
+## Expected Layout
 
 ```text
 /workspace/BAGEL
@@ -27,83 +84,149 @@ Recommended layout:
 /workspace/bagel-brkv-lifetime
 ```
 
-Install the helper scripts into BAGEL first:
+Install helper scripts and BAGEL hooks:
 
 ```bash
+cd /workspace/bagel-brkv-lifetime
 scripts/install_into_bagel.sh /workspace/BAGEL
 ```
 
-On NVIDIA, keep BAGEL computation semantics unchanged. Only adapt device/dtype defaults and paths.
-
-## Main Commands
-
-Build a schedule from a labeled calibration CSV:
-
-```bash
-python -m brkv.build_brkv_schedule \
-  --calibration-csv outputs/full/calibration/summary_labeled.csv \
-  --output-dir outputs/full/schedules \
-  --profiles conservative:0,balanced:1,aggressive:2 \
-  --fail-rate-budget 0.10 \
-  --suffix-safe
-```
-
-Run BAGEL calibration via wrapper:
-
-```bash
-python -m brkv.launch_bagel_experiment \
-  --config configs/nvidia_full.yaml \
-  --bagel-root /workspace/BAGEL \
-  --stage calibration
-```
-
-Run joint policy validation:
-
-```bash
-python -m brkv.launch_bagel_experiment \
-  --config configs/nvidia_full.yaml \
-  --bagel-root /workspace/BAGEL \
-  --stage policy \
-  --scheduler-json outputs/full/schedules/balanced_scheduler.json
-```
-
-## Experiment Contract
-
-Calibration CSV rows should contain at least:
+The installer copies `bagel_scripts/*.py` into the BAGEL root and applies:
 
 ```text
-role, layer_band, cutoff, human_label, zeroed_bytes_upper_bound, retired_step_fraction
+patches/uni4uni_kv_bagel_hooks.patch
 ```
 
-Accepted labels:
+If the patch is already applied, the installer should report that and continue.
+
+## Three-Task Demo
+
+Run a full-KV baseline and one Uni4Uni-KV variant over three tasks:
+
+1. Understanding: read text from `test_images/meme.jpg`.
+2. Text-to-image: long prompt for a rocket-powered raccoon astronaut.
+3. Image editing: `test_images/women.jpg`, change outfit to vivid blue and background to snowy mountain lake.
+
+GPU command:
+
+```bash
+cd /workspace/BAGEL
+python run_pyramid_topk_kv_demo.py \
+  --device cuda \
+  --dtype bfloat16 \
+  --image-size 512 \
+  --timesteps 50 \
+  --max-new-tokens 256 \
+  --beta 20 \
+  --alpha-understanding 8 \
+  --understanding-keep-ratio 0.5 \
+  --gen-keep-start 0.8 \
+  --gen-keep-end 0.1 \
+  --output-dir outputs/uni4uni_kv_demo_b20_a8_s80_e10
+```
+
+Expected outputs:
 
 ```text
-pass
-minor
-acceptable
-fail
-unlabeled
+summary.json
+run_report.md
+topk_stats.csv
+baseline_generation.png
+topk_generation.png
+baseline_editing.png
+topk_editing.png
 ```
 
-`unlabeled` rows are ignored by the schedule builder unless `--allow-unlabeled` is set.
+## Parameter Sweep
 
-## What to Preserve
+Run the standard-step parameter sweep:
 
-- Keep BAGEL weights frozen.
-- Keep the original edit prompts and source images recorded in outputs.
-- Preserve baseline images.
-- Keep `T+1` as the no-retirement action.
-- Do not claim speedup from zero-masking probes. Speed claims require packed-KV skipping or real attention-kernel work removal.
+```bash
+cd /workspace/BAGEL
+python run_uni4uni_kv_sweep.py \
+  --device cuda \
+  --dtype bfloat16 \
+  --image-size 512 \
+  --timesteps 50 \
+  --max-new-tokens 256 \
+  --betas 8,14,16,20 \
+  --alphas 8,16 \
+  --schedules '0.8->0.1,0.8->0.2,0.9->0.2,0.9->0.3' \
+  --understanding-keep-ratio 0.5 \
+  --output-root outputs/uni4uni_kv_param_sweep_512_t50
+```
 
-## Full-Run Checklist
+For a quick sanity check, use:
 
-1. Verify BAGEL baseline editing output is correct.
-2. Run `configs/nvidia_full.yaml` calibration grid.
-3. Label output contact sheets.
-4. Build BR-KV profiles.
-5. Validate profiles as joint policies.
-6. Add matched-benefit baselines if time allows:
-   - random cells with same retired benefit
-   - static `L24-L27`
-   - role-agnostic table
-7. Report quality pass rate vs saved KV-attention work.
+```bash
+python run_uni4uni_kv_sweep.py \
+  --device cuda \
+  --dtype bfloat16 \
+  --image-size 320 \
+  --timesteps 6 \
+  --max-new-tokens 96 \
+  --betas 20 \
+  --alphas 8 \
+  --schedules '0.8->0.1' \
+  --limit 1 \
+  --output-root outputs/uni4uni_kv_smoke
+```
+
+## Quality Checks
+
+Before reporting a configuration as promising, inspect images and text directly.
+
+Understanding:
+
+```text
+text output is non-empty
+visible image text is at least partly read correctly
+explanation matches the image
+```
+
+Text-to-image:
+
+```text
+contains raccoon-like subject
+contains rocket/astronaut cues
+follows the long prompt without pure noise or black image
+```
+
+Editing:
+
+```text
+source identity and pose remain recognizable
+outfit is clearly blue
+background resembles snowy mountain lake
+white poodle applique is preferably preserved
+```
+
+Also check `topk_stats.csv`:
+
+```text
+deep layers should have lower keep ratio than shallow layers
+later generation/editing timesteps should have lower keep ratio than early timesteps
+active VAE latent/self KV should be protected, not counted as evicted candidates
+```
+
+## Reporting
+
+Report at least:
+
+```text
+config name
+beta
+alpha_understanding
+gen_keep_start -> gen_keep_end
+mean_keep_ratio
+theoretical_skipped_kv_gib
+baseline and Uni4Uni-KV outputs
+human quality note for each task
+elapsed time and CUDA reserved memory
+```
+
+Do not claim speedup from this mask-probe implementation. It may be slower because TopK and masking add overhead.
+
+## Older BR-KV Tools
+
+The repository still contains older BR-KV calibration utilities under `brkv/`, `configs/`, and `examples/`. They are kept for reference and schedule-building experiments, but the current main path is the Uni4Uni-KV demo and sweep above.
